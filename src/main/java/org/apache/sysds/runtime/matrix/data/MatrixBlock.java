@@ -4758,133 +4758,104 @@ public class MatrixBlock extends MatrixValue implements CacheBlock<MatrixBlock>,
 	/**
 	 * Pick the quantiles out of this matrix. If this matrix contains two columns it is weighted quantile picking.
 	 * If a single column it is unweighted.
-	 * 
+	 *
 	 * Note the values are assumed to be sorted.
-	 * 
+	 *
 	 * @param quantiles The quantiles to pick
 	 * @param ret The result matrix
 	 * @return The result matrix
 	 */
-	public final MatrixBlock pickValues(MatrixValue quantiles, MatrixValue ret) {
-		return pickValues(quantiles, ret, false);
-	}
-	
-	public MatrixBlock pickValues(MatrixValue quantiles, MatrixValue ret, boolean average) {
-		MatrixBlock qs=checkType(quantiles);
-		
-		if ( qs.clen != 1 ) {
+	public MatrixBlock pickValues(MatrixValue quantiles, MatrixValue ret) {
+		MatrixBlock qs = checkType(quantiles);
+
+		if(qs.clen != 1) {
 			throw new DMLRuntimeException("Multiple quantiles can only be computed on a 1D matrix");
 		}
-		
+
 		MatrixBlock output = checkType(ret);
 
-		if(output==null)
-			output=new MatrixBlock(qs.rlen, qs.clen, false); // resulting matrix is mostly likely be dense
+		if(output == null)
+			output = new MatrixBlock(qs.rlen, qs.clen, false); // resulting matrix is mostly likely be dense
 		else
 			output.reset(qs.rlen, qs.clen, false);
 
 		for(int i = 0; i < qs.rlen; i++) {
-			// FIXME: include the average parameter here to fix SYSTEMDS-3953
 			output.set(i, 0, this.pickValue(qs.get(i, 0)));
 		}
-		
+
 		return output;
 	}
-	
+
 	/**
 	 * Pick the median value from this matrix. If this matrix has two columns it is weighted picking using the
 	 * weight column, otherwise it is unweighted over the single column.
-	 * 
+	 *
 	 * Note the values are assumed to be sorted.
-	 * 
+	 *
 	 * @return The median value
 	 */
 	public double median() {
-		if(getNumColumns() == 1)
-			return pickValue(0.5, getNumRows() % 2 == 0);
-		double sum_wt = sumWeightForQuantile();
-		return pickValue(0.5, sum_wt%2==0);
+		return pickValue(0.5);
 	}
 
 	/**
-	 * Pick a specific quantile from this matrix. If this matrix has two columns it is weighted picking, otherwise it is unweighted.
-	 * 
+	 * Pick a specific quantile from this matrix using R's default (type 7) definition: linear interpolation between the
+	 * two adjacent order statistics. If this matrix has two columns the second is treated as integer weights.
+	 *
 	 * Note the values are assumed to be sorted.
-	 * 
-	 * @param quantile The quantile to pick
+	 *
+	 * @param quantile The quantile in [0, 1] to pick
 	 * @return The quantile
 	 */
-	public final double pickValue(double quantile){
-		return pickValue(quantile, false);
-	}
-	
-	/**
-	 * Pick a specific quantile from this matrix. If this matrix has two columns it is weighted picking, otherwise it is unweighted.
-	 * 
-	 * Note the values are assumed to be sorted.
-	 * 
-	 * @param quantile The quantile to pick
-	 * @param average If the quantile is averaged.
-	 * @return The quantile
-	 */
-	public final double pickValue(double quantile, boolean average) {
+	public final double pickValue(double quantile) {
 		if(this.getNumColumns() == 1)
-			return pickUnweightedValue(quantile, average);
-		return pickWeightedValue(quantile, average);
+			return pickUnweightedValue(quantile);
+		return pickWeightedValue(quantile);
 	}
 
-	private double pickUnweightedValue(double quantile, boolean average) {
-		// Mirror the weighted convention (pickWeightedValue) with an implicit weight of 1 per value, so a single
-		// column yields the same quantile as the equivalent two-column (value, weight) representation: take the
-		// ceil-based rank and only average adjacent order statistics when an even number of values straddles it.
+	private double pickUnweightedValue(double quantile) {
+		// R quantile type 7: h = (n-1)*p + 1 (1-based), Q = (1-g)*x[floor(h)] + g*x[floor(h)+1]
 		final int rows = getNumRows();
-		average = average && (rows % 2 == 0);
-		final int pos = (int) Math.ceil(quantile * rows); // 1-based rank
-		final int i = Math.min(Math.max(pos - 1, 0), rows - 1);
-		if(average && pos > 0 && pos < rows)
-			return (get(i, 0) + get(i + 1, 0)) / 2;
-		return get(i, 0);
+		final double h = (rows - 1) * quantile + 1.0;
+		final int lo = Math.max(1, Math.min((int) Math.floor(h), rows));
+		final int hi = Math.min(lo + 1, rows);
+		final double g = h - Math.floor(h);
+		final double loVal = get(lo - 1, 0);
+		if(g == 0.0 || hi == lo)
+			return loVal;
+		return (1.0 - g) * loVal + g * get(hi - 1, 0);
 	}
 
-	private double pickWeightedValue(double quantile, boolean average) {
-		double sum_wt = sumWeightForQuantile();
-		
-		// do averaging only if it is asked for; and sum_wt is even
-		average = average && (sum_wt%2 == 0);
-		
-		int pos = (int) Math.ceil(quantile*sum_wt);
-		
-		int t = 0, i=-1;
+	private double pickWeightedValue(double quantile) {
+		// R quantile type 7 generalized to integer weights: treat as expanded sorted sequence of length sum_wt.
+		final double sum_wt = sumWeightForQuantile();
+		final double h = (sum_wt - 1.0) * quantile + 1.0;
+		final long lo = Math.max(1L, (long) Math.floor(h));
+		final long hi = (long) Math.min(lo + 1L, sum_wt);
+		final double g = h - Math.floor(h);
+		final double loVal = valueAtWeightedRank(lo);
+		if(g == 0.0 || hi == lo)
+			return loVal;
+		return (1.0 - g) * loVal + g * valueAtWeightedRank(hi);
+	}
+
+	private double valueAtWeightedRank(long rank) {
+		// Walk cumulative weights until we reach the requested 1-based rank in the expanded sequence.
+		final int rows = getNumRows();
+		long t = 0;
+		int i = -1;
 		do {
 			i++;
-			t += get(i,1);
-		} while(t<pos && i < getNumRows());
-		
-		if ( get(i,1) != 0 ) {
-			// i^th value is present in the data set, simply return it
-			if ( average && pos < getNumRows()-1 ) {
-				if(pos < t) {
-					return get(i,0);
-				}
-				if(get(i+1,1) != 0)
-					return (get(i,0)+get(i+1,0))/2;
-				else
-					// (i+1)^th value is 0. So, fetch (i+2)^th value
-					return (get(i,0)+get(i+2,0))/2;
-			}
-			else 
-				return get(i, 0);
+			t += (long) get(i, 1);
 		}
-		else {
-			// i^th value is not present in the data set. 
-			// It can only happen in the case where i^th value is 0.0; and 0.0 is not present in the data set (but introduced by sort).
-			if ( i+1 < getNumRows() )
-				// when 0.0 is not the last element in the sorted order
-				return get(i+1,0);
-			else
-				// when 0.0 is the last element in the sorted order (input data is all negative)
-				return get(i-1,0);
-		}
+		while(t < rank && i + 1 < rows);
+
+		if(get(i, 1) != 0)
+			return get(i, 0);
+		// i^th value is 0.0 introduced by sort but not present in the original data; use a real neighbor.
+		if(i + 1 < rows)
+			return get(i + 1, 0);
+		return get(i - 1, 0);
 	}
 	
 	/**

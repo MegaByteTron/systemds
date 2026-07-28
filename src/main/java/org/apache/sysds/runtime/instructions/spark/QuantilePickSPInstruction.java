@@ -172,57 +172,96 @@ public class QuantilePickSPInstruction extends BinarySPInstruction {
 		{
 			//sort blocks (values sorted but blocks and partitions are not)
 			w = w.sortByKey();
-			
-			//compute cumsum weights per partition
-			//with assumption that partition aggregates fit into memory
-			List<Tuple2<Integer,Double>> partWeights = w
-				.mapPartitionsWithIndex(new SumWeightsFunction(), false).collect();
-			
+
+			// compute cumsum weights per partition
+			// with assumption that partition aggregates fit into memory
+			List<Tuple2<Integer, Double>> partWeights = w.mapPartitionsWithIndex(new SumWeightsFunction(), false)
+				.collect();
+
 			//compute sum of weights
 			ret[0] = partWeights.stream().mapToDouble(p -> p._2()).sum();
-			
-			//compute total cumsum and determine partitions
-			double[] qdKeys = new double[quantiles.length];
-			long[] qiKeys = new long[quantiles.length];
-			int[] partitionIDs = new int[quantiles.length];
-			double[] offsets = new double[quantiles.length];
-			for( int i=0; i<quantiles.length; i++ ) {
-				qdKeys[i] = quantiles[i]*ret[0];
-				qiKeys[i] = (long)Math.ceil(qdKeys[i]);
+			final long sumWt = (long) ret[0];
+
+			// For average=true (VALUEPICK/MEDIAN) extract two adjacent order statistics per quantile and interpolate as
+			// R quantile type 7. For average=false (IQM) keep the ceil-based rank so computeIQMCorrection sees the raw
+			// boundary values.
+			final int nk = average ? 2 * quantiles.length : quantiles.length;
+			double[] qdKeys = new double[nk];
+			long[] qiKeys = new long[nk];
+			double[] gs = average ? new double[quantiles.length] : null;
+			if(average) {
+				for(int i = 0; i < quantiles.length; i++) {
+					final double h = (ret[0] - 1.0) * quantiles[i] + 1.0;
+					final long lo = Math.max(1L, Math.min((long) Math.floor(h), sumWt));
+					final long hi = Math.min(lo + 1L, sumWt);
+					gs[i] = h - Math.floor(h);
+					qiKeys[2 * i] = lo;
+					qiKeys[2 * i + 1] = hi;
+					qdKeys[2 * i] = lo;
+					qdKeys[2 * i + 1] = hi;
+				}
 			}
+			else {
+				for(int i = 0; i < quantiles.length; i++) {
+					qdKeys[i] = quantiles[i] * ret[0];
+					qiKeys[i] = (long) Math.ceil(qdKeys[i]);
+				}
+			}
+
+			int[] partitionIDs = new int[nk];
+			double[] offsets = new double[nk];
 			double cumSum = 0;
-			for( Tuple2<Integer,Double> psum : partWeights ) {
+			for(Tuple2<Integer, Double> psum : partWeights) {
 				double tmp = cumSum + psum._2();
-				for(int i=0; i<quantiles.length; i++)
-					if( tmp >= qiKeys[i] && partitionIDs[i] == 0 ) {
+				for(int i = 0; i < nk; i++)
+					if(tmp >= qiKeys[i] && partitionIDs[i] == 0) {
 						partitionIDs[i] = psum._1();
 						offsets[i] = cumSum;
 					}
 				cumSum = tmp;
 			}
-			
-			//get keys and values for quantile cutoffs 
-			List<Tuple2<Integer,double[]>> qVals = w
-				.mapPartitionsWithIndex(new ExtractWeightedQuantileFunction(
-					mc, qdKeys, qiKeys, partitionIDs, offsets), false).collect();
-			for( Tuple2<Integer,double[]> qVal : qVals ) {
-				ret[qVal._1()+1] = qVal._2()[0];
-				ret[qVal._1()+quantiles.length+1] = qVal._2()[1];
-				ret[qVal._1()+2*quantiles.length+1] = qVal._2()[2];
+
+			// get keys and values for quantile cutoffs
+			List<Tuple2<Integer, double[]>> qVals = w.mapPartitionsWithIndex(
+				new ExtractWeightedQuantileFunction(mc, qdKeys, qiKeys, partitionIDs, offsets), false).collect();
+
+			if(average) {
+				double[] extracted = new double[nk];
+				for(Tuple2<Integer, double[]> qVal : qVals)
+					extracted[qVal._1()] = qVal._2()[2];
+				for(int i = 0; i < quantiles.length; i++) {
+					ret[i + 2 * quantiles.length + 1] = (gs[i] == 0.0) ? extracted[2 * i] : (1.0 - gs[i]) *
+						extracted[2 * i] + gs[i] * extracted[2 * i + 1];
+				}
+			}
+			else {
+				for(Tuple2<Integer, double[]> qVal : qVals) {
+					ret[qVal._1() + 1] = qVal._2()[0];
+					ret[qVal._1() + quantiles.length + 1] = qVal._2()[1];
+					ret[qVal._1() + 2 * quantiles.length + 1] = qVal._2()[2];
+				}
 			}
 		}
 		else {
-			ret[0] = mc.getRows();
+			final long N = mc.getRows();
+			ret[0] = N;
 			for(int i = 0; i < quantiles.length; i++) {
-				ret[i + 1] = quantiles[i] * mc.getRows();
+				ret[i + 1] = quantiles[i] * N;
 				ret[i + quantiles.length + 1] = Math.ceil(ret[i + 1]) - ret[i + 1];
-				long key = (long) Math.ceil(ret[i + 1]);
-				ret[i + 2 * quantiles.length + 1] = lookupKey(w, key, mc.getBlocksize());
-
-				// average w/ next value for even-length arrays (mirrors CP QuantilePickCPInstruction)
-				if(average && mc.getRows() % 2 == 0 && key < (mc.getRows() - 1)) {
-					ret[i + 2 * quantiles.length + 1] += lookupKey(w, key + 1, mc.getBlocksize());
-					ret[i + 2 * quantiles.length + 1] /= 2;
+				if(average) {
+					// R quantile type 7: linear interpolation between adjacent order statistics (SYSTEMDS-3953)
+					final double h = (N - 1) * quantiles[i] + 1.0;
+					final long lo = Math.max(1L, Math.min((long) Math.floor(h), N));
+					final long hi = Math.min(lo + 1L, N);
+					final double g = h - Math.floor(h);
+					final double loVal = lookupKey(w, lo, mc.getBlocksize());
+					ret[i + 2 * quantiles.length + 1] = (g == 0.0 || hi == lo) ? loVal : (1.0 - g) * loVal +
+						g * lookupKey(w, hi, mc.getBlocksize());
+				}
+				else {
+					// IQM needs the raw ceil-based boundary order statistic for computeIQMCorrection
+					long key = (long) Math.ceil(ret[i + 1]);
+					ret[i + 2 * quantiles.length + 1] = lookupKey(w, key, mc.getBlocksize());
 				}
 			}
 		}
